@@ -5,6 +5,7 @@ extern crate structopt;
 mod data;
 mod scope;
 
+use std::collections::HashMap;
 use std::io::{ self, BufRead };
 
 use structopt::StructOpt;
@@ -22,14 +23,16 @@ struct Config {
 
 static mut CFG: Config = Config { verbose: false };
 
+type Vars = HashMap<String, Vec<String>>;
 
-fn equal(a: &[String], b: &[String], scope: &Env) -> bool {
+
+fn equal(a: Vec<String>, b: Vec<String>, scope: &Env, vars: &mut Vars) -> bool {
     if a == b {
         true
 
     } else {
-        let a = reduce_n_times(a.to_vec(), scope, 0);
-        let b = reduce_n_times(b.to_vec(), scope, 0);// FIXME: fn-typ equal on substitution
+        let a = reduce_n_times(a.clone(), scope, vars, 0);
+        let b = reduce_n_times(b.clone(), scope, vars, 0);// FIXME: fn-typ equal on substitution
 
         a == b
     }
@@ -38,13 +41,17 @@ fn equal(a: &[String], b: &[String], scope: &Env) -> bool {
 
 // [AREA] Well-Formedness
 //
-fn _wf_sgl(scope: &Env, x: &str) -> bool {
+fn _wf_sgl(scope: &Env, _: &mut (), x: &str) -> bool {
     debug("[canform] typ == x || ?x");
 
     "typ" == x || scope.contains_item(x)
 }
 
-fn _wf_lambda(scope: &Env, bound: &str, bound_ty: &[String], body: &[String]) -> bool {
+fn _wf_var(scope: &Env, _: &mut (), var: &str) -> bool {
+    !scope.contains_item(var)
+}
+
+fn _wf_lambda(scope: &Env, _: &mut (), bound: &str, bound_ty: &[String], body: &[String]) -> bool {
     let mut inner_scope = scope.clone();
     inner_scope.insert(bound.to_string(), (bound_ty.to_vec(), None));
 
@@ -53,7 +60,7 @@ fn _wf_lambda(scope: &Env, bound: &str, bound_ty: &[String], body: &[String]) ->
     well_formed(body, &inner_scope)
 }
 
-fn _wf_fn_ty(scope: &Env, bound: &str, source: &[String], target: &[String]) -> bool {
+fn _wf_fn_ty(scope: &Env, _: &mut (), bound: &str, source: &[String], target: &[String]) -> bool {
     let mut inner_scope = scope.clone();
     inner_scope.insert(bound.to_string(), (source.to_vec(), None));
 
@@ -62,14 +69,14 @@ fn _wf_fn_ty(scope: &Env, bound: &str, source: &[String], target: &[String]) -> 
     well_formed(source, scope) && well_formed(target, &inner_scope)
 }
 
-fn _wf_call(scope: &Env, args: &[Vec<String>], fn_name: &str) -> bool {
+fn _wf_call(scope: &Env, _out: &mut (), args: &[Vec<String>], fn_name: &str) -> bool {
     debug("[canform] (canform fn_name) && (canform args)");
 
-    _wf_sgl(scope, fn_name) && args.iter().all(|arg| well_formed(arg, scope))
+    well_formed(&[fn_name.to_string()], scope) && args.iter().all(|arg| well_formed(arg, scope))
 }
 
 fn well_formed(expr: &[String], scope: &Env) -> bool {
-    data::recurse(expr, scope, true, _wf_sgl, _wf_lambda, _wf_fn_ty, _wf_call)
+    data::recurse(expr, scope, &mut (), true, _wf_sgl, _wf_var, _wf_lambda, _wf_fn_ty, _wf_call)
 }
 //
 // [END] Well-Formedness
@@ -77,23 +84,38 @@ fn well_formed(expr: &[String], scope: &Env) -> bool {
 
 // [AREA] Typechecking
 //
-fn _tc_sgl((ty, scope): (&[String], &Env), x: &str) -> bool {
+fn _tc_sgl((ty, scope): (&[String], &Env), vars: &mut Vars, x: &str) -> bool {
+    if ty == &[] as &[String] {
+        return true;
+    }
+
     if "typ" == x {
         debug("[??] typ == ty");
 
-        equal(&["typ".to_string()], ty, scope)
+        equal(["typ".to_string()].to_vec(), ty.to_vec(), scope, vars)
 
     } else {
         let actual = &scope.get(x).unwrap().0;
 
         debug("[??] ty == actual");
 
-        equal(ty, actual, scope)
+        equal(ty.to_vec(), actual.to_vec(), scope, vars)
     }
 }
 
-fn _tc_lambda((ty, scope): (&[String], &Env), bound: &str, bound_ty: &[String], body: &[String]) -> bool {
-    let ty = reduce_n_times(ty.to_vec(), scope, 0);
+fn _tc_var((ty, scope): (&[String], &Env), vars: &mut Vars, var: &str) -> bool {
+    if let Some(old_ty) = vars.get(var) {
+        ty == &[] as &[String] || equal(ty.to_vec(), old_ty.to_vec(), scope, vars)
+
+    } else {
+        vars.insert(var.to_string(), ty.to_vec());
+
+        true
+    }
+}
+
+fn _tc_lambda((ty, scope): (&[String], &Env), vars: &mut Vars, bound: &str, bound_ty: &[String], body: &[String]) -> bool {
+    let ty = reduce_n_times(ty.to_vec(), scope, vars, 0);
 
     if let [.., head] = &ty[..] {
         if &head[0..=0] == ">" {
@@ -106,7 +128,7 @@ fn _tc_lambda((ty, scope): (&[String], &Env), bound: &str, bound_ty: &[String], 
                 let mut target = target.to_vec();
                 shift_left(&mut target, 1);
 
-                assert!(equal(&source, bound_ty, scope), "domains don't match: {} : {:?} =/= {:?}", bound, source, bound_ty);
+                assert!(equal(source.clone(), bound_ty.to_vec(), scope, vars), "domains don't match: {} : {:?} =/= {:?}", bound, source, bound_ty);
 
                 let val_alias = if ty_bound == bound { None } else { Some(vec![ty_bound.to_string()]) };
 
@@ -116,7 +138,7 @@ fn _tc_lambda((ty, scope): (&[String], &Env), bound: &str, bound_ty: &[String], 
 
                 debug("[??] ?? body target");
 
-                typecheck(body, &target, &inner_scope)
+                typecheck(body, &target, &inner_scope, vars)
 
             } else {
                 panic!["syntax error: `>{}` requires 2 parameters", ty_bound]
@@ -131,8 +153,8 @@ fn _tc_lambda((ty, scope): (&[String], &Env), bound: &str, bound_ty: &[String], 
     }
 }
 
-fn _tc_fn_ty((ty, scope): (&[String], &Env), bound: &str, source: &[String], target: &[String]) -> bool {
-    assert![equal(&["typ".to_string()], ty, scope), "doesn't match: typ ~~ {:?}", ty];
+fn _tc_fn_ty((ty, scope): (&[String], &Env), vars: &mut Vars, bound: &str, source: &[String], target: &[String]) -> bool {
+    assert![equal(["typ".to_string()].to_vec(), ty.to_vec(), scope, vars), "doesn't match: typ ~~ {:?}", ty];
 
     let mut inner_scope = scope.clone();
     inner_scope.insert(bound.to_string(), (source.to_vec(), None));
@@ -141,11 +163,11 @@ fn _tc_fn_ty((ty, scope): (&[String], &Env), bound: &str, source: &[String], tar
 
     debug("[??] (?? source typ) && (?? target typ)");
 
-    typecheck(source, &typ, scope) && typecheck(&target, &typ, &inner_scope)
+    typecheck(source, &typ, scope, vars) && typecheck(&target, &typ, &inner_scope, vars)
 }
 
-fn _tc_call_util(ret_ty: &[String], scope: &Env, args: &[Vec<String>], fn_ty: &[String]) -> bool {
-    let fn_ty = reduce_n_times(fn_ty.to_vec(), scope, 0);
+fn _tc_call_util(ret_ty: &[String], vars: &mut Vars, scope: &Env, args: &[Vec<String>], fn_ty: &[String]) -> bool {
+    let fn_ty = reduce_n_times(fn_ty.to_vec(), scope, vars, 0);
 
     if let [ref rest @ .., head] = &fn_ty[..] {
         let mut rest = rest.to_vec();
@@ -159,12 +181,12 @@ fn _tc_call_util(ret_ty: &[String], scope: &Env, args: &[Vec<String>], fn_ty: &[
 
                     debug("[??] (?? arg source) && (call_util inner_scope ret_ty args[..] target)");
 
-                    typecheck(arg, source, scope) && equal(ret_ty, &target, &inner_scope)
+                    typecheck(arg, source, scope, vars) && (ret_ty == &[] as &[String] || equal(ret_ty.to_vec(), target.to_vec(), &inner_scope, vars))
 
                 } else {
                     debug("[??] (?? arg source) && (call_util scope ret_ty args[..] target)");
 
-                    typecheck(arg, source, scope) && equal(ret_ty, &target, scope)
+                    typecheck(arg, source, scope, vars) && (ret_ty == &[] as &[String] || equal(ret_ty.to_vec(), target.to_vec(), scope, vars))
                 }
 
             } else if let [rest_args @ .., arg] = &args[..] {
@@ -174,22 +196,21 @@ fn _tc_call_util(ret_ty: &[String], scope: &Env, args: &[Vec<String>], fn_ty: &[
 
                     debug("[??] (?? arg source) && (call_util inner_scope ret_ty args[..] target)");
 
-                    typecheck(arg, source, scope) && _tc_call_util(ret_ty, &inner_scope, rest_args, target)
+                    typecheck(arg, source, scope, vars) && _tc_call_util(ret_ty, vars, &inner_scope, rest_args, target)
 
                 } else {
                     debug("[??] (?? arg source) && (call_util scope ret_ty args[..] target)");
 
-                    typecheck(arg, source, scope) && _tc_call_util(ret_ty, scope, rest_args, target)
+                    typecheck(arg, source, scope, vars) && _tc_call_util(ret_ty, vars, scope, rest_args, target)
                 }
 
             } else {
                 debug("[??] ret_ty == fn_ty");
 
-                equal(ret_ty, &fn_ty, scope)
+                equal(ret_ty.to_vec(), fn_ty, scope, vars)
             }
 
         } else {
-            eprintln!("{:?}\n{:#?}\n", head, rest);
             unreachable!["invalid function type syntax"]// NOTE: Also not checking &head[0..=0] == ">"
         }
 
@@ -197,16 +218,16 @@ fn _tc_call_util(ret_ty: &[String], scope: &Env, args: &[Vec<String>], fn_ty: &[
         panic!["invalid function type: {:?}", fn_ty]
     }
 }
-fn _tc_call((ty, scope): (&[String], &Env), args: &[Vec<String>], fn_name: &str) -> bool {
-    let (fn_ty, _) = scope.get(fn_name).unwrap();
+fn _tc_call((ty, scope): (&[String], &Env), vars: &mut Vars, args: &[Vec<String>], fn_name: &str) -> bool {
+    let fn_ty = scope.get(fn_name).map(|(ty, _)| ty).or(vars.get(fn_name)).cloned().unwrap();
 
-    _tc_call_util(ty, scope, args, fn_ty)
+    _tc_call_util(ty, vars, scope, args, &fn_ty)
 }
 
-fn typecheck(expr: &[String], ty: &[String], scope: &Env) -> bool {
+fn typecheck(expr: &[String], ty: &[String], scope: &Env, vars: &mut Vars) -> bool {
     assert![well_formed(expr, scope), "expression isn't well-formed"];
 
-    data::recurse(expr, (ty, scope), true, _tc_sgl, _tc_lambda, _tc_fn_ty, _tc_call)
+    data::recurse(expr, (ty, scope), vars, true, _tc_sgl, _tc_var, _tc_lambda, _tc_fn_ty, _tc_call)
 }
 //
 // [END] Typechecking
@@ -220,7 +241,7 @@ fn typecheck(expr: &[String], ty: &[String], scope: &Env) -> bool {
 /// # Returns
 /// Returns whether the expression can be reduced further.
 ///
-fn reduce(expr: Vec<String>, scope: &Env) -> (bool, Vec<String>) {
+fn reduce(expr: Vec<String>, scope: &Env, vars: &mut Vars) -> (bool, Vec<String>) {
     assert![well_formed(&expr, scope), "expression isn't well-formed"];
 
     let mut extend_eq_family = None;
@@ -243,6 +264,7 @@ fn reduce(expr: Vec<String>, scope: &Env) -> (bool, Vec<String>) {
 
     for elem in elems {
         match &elem[..] {
+            [var] if &var[0..=0] == "?" => ret.push(var.to_string()),
             [x] => {
                 if "typ" == x {
                     ret.push("typ".to_string());
@@ -268,7 +290,7 @@ fn reduce(expr: Vec<String>, scope: &Env) -> (bool, Vec<String>) {
                     let mut inner_scope = scope.clone();
                     inner_scope.insert(bound.to_string(), (bound_ty.to_vec(), None));
 
-                    let (more, mut new) = reduce(body[..body.len() - bound_ty.len()].to_vec(), &inner_scope);
+                    let (more, mut new) = reduce(body[..body.len() - bound_ty.len()].to_vec(), &inner_scope, vars);
 
                     let mut bound_ty = bound_ty.to_vec();
 
@@ -301,22 +323,22 @@ fn reduce(expr: Vec<String>, scope: &Env) -> (bool, Vec<String>) {
                         subst(&mut target, &head[1..], bound.clone());
                     }
 
-                    assert![typecheck(&source, &["typ".to_string()], scope), "1st argument of `>{}` must be a type", bound];
+                    assert![typecheck(&source, &["typ".to_string()], scope, vars), "1st argument of `>{}` must be a type", bound];
 
-                    let (can_a, mut a) = reduce(source.to_vec(), scope);
+                    let (can_a, mut a) = reduce(source.to_vec(), scope, vars);
 
                     let (can_b, mut b) = if bound.len() > 0 {
                         let mut inner_scope = scope.clone();
                         inner_scope.insert(bound.clone(), (source.to_vec(), None));
 
-                        assert![typecheck(&target, &["typ".to_string()], &inner_scope), "2nd argument of `>{}` must be a type", bound];
+                        assert![typecheck(&target, &["typ".to_string()], &inner_scope, vars), "2nd argument of `>{}` must be a type", bound];
 
-                        reduce(target, &inner_scope)
+                        reduce(target, &inner_scope, vars)
 
                     } else {
-                        assert![typecheck(&target, &["typ".to_string()], scope), "2nd argument of `>{}` must be a function", bound];
+                        assert![typecheck(&target, &["typ".to_string()], scope, vars), "2nd argument of `>{}` must be a function", bound];
 
-                        reduce(target, scope)
+                        reduce(target, scope, vars)
                     };
 
                     can_reduce_more |= can_a || can_b;
@@ -334,6 +356,12 @@ fn reduce(expr: Vec<String>, scope: &Env) -> (bool, Vec<String>) {
             },
 
             [raw_args @ .., func] => {
+                if let Some(ty) = vars.get(func) {// TODO: Typecheck?
+                    ret.extend(elem.to_vec());
+
+                    continue;
+                }
+
                 let (ty, val) = scope.get(func).unwrap();
 
                 let mut args = vec![];
@@ -344,7 +372,7 @@ fn reduce(expr: Vec<String>, scope: &Env) -> (bool, Vec<String>) {
                     let mut raw_arg = raw_arg.to_vec();
                     shift_left(&mut raw_arg, 1);
 
-                    let (more, mut arg) = reduce(raw_arg, scope);
+                    let (more, mut arg) = reduce(raw_arg, scope, vars);
 
                     can_reduce_more |= more;
                     shift_right(&mut arg, 1);
@@ -365,7 +393,7 @@ fn reduce(expr: Vec<String>, scope: &Env) -> (bool, Vec<String>) {
                     let mut arg = args.pop().unwrap();// NOTE: Arguments are ordered bottom->up, that is `args.last()` is the first argument.
                     shift_left(&mut arg, 1);
 
-                    assert![typecheck(&arg, &source, scope), "argument doesn't match lambda's domain"];
+                    assert![typecheck(&arg, &source, scope, vars), "argument doesn't match lambda's domain"];
 
                     if let [rest @ .., head] = &lambda[..] {
                         if &head[0..=0] == "<" {
@@ -387,7 +415,7 @@ fn reduce(expr: Vec<String>, scope: &Env) -> (bool, Vec<String>) {
                             let mut inner_scope = scope.clone();
                             inner_scope.insert(bound, (bound_ty, Some(arg)));
 
-                            let (more, reduced) = reduce(body, &inner_scope);
+                            let (more, reduced) = reduce(body, &inner_scope, vars);
 
                             can_reduce_more |= more;
                             ret.extend(reduced);
@@ -396,7 +424,16 @@ fn reduce(expr: Vec<String>, scope: &Env) -> (bool, Vec<String>) {
                         }
                     }
 
-                    unimplemented!()
+                    // TODO: Typecheck the call?
+
+                    shift_right(&mut arg, 1);
+
+                    for arg in args {
+                        ret.extend(arg);
+                    }
+
+                    ret.extend(arg);
+                    ret.extend(lambda.to_vec());
 
                 } else {
                     for arg in args {
@@ -429,11 +466,11 @@ fn reduce(expr: Vec<String>, scope: &Env) -> (bool, Vec<String>) {
 /// # Panics
 /// This function panics when the expression isn't well-formed or well-typed.
 ///
-fn reduce_n_times(expr: Vec<String>, scope: &Env, mut depth: usize) -> Vec<String> {
-    let (mut more, mut ret) = reduce(expr, scope);
+fn reduce_n_times(expr: Vec<String>, scope: &Env, vars: &mut Vars, mut depth: usize) -> Vec<String> {
+    let (mut more, mut ret) = reduce(expr, scope, vars);
 
     while more && depth != 1 {
-        let (new_more, new_ret) = reduce(ret, scope);
+        let (new_more, new_ret) = reduce(ret, scope, vars);
 
         more = new_more;
         ret = new_ret;
@@ -460,7 +497,7 @@ fn main() {
 
                 let mut expr = data::read_expr(&mut it);
 
-                expr = reduce_n_times(expr, &scope, depth);
+                expr = reduce_n_times(expr, &scope, &mut HashMap::new(), depth);
 
                 println!["#out\n{}\n", expr.join("\n")];
             },
@@ -482,35 +519,61 @@ fn main() {
                 scope.insert(head, (ty, None));
             },
             "#!define" => {
-                let mut head = data::read_expr(&mut it);
+                let mut lhs = data::read_expr(&mut it);
 
-                assert_eq![1, head.len(), "lvalue can be just an identifier"];
+                if lhs.len() == 1 {
+                    let head = lhs.pop().unwrap();
 
-                let head = head.pop().unwrap();
+                    assert![scope.contains_item(&head), "not declared: {:?}", head];
+                    assert_eq![None, scope.get(&head).unwrap().1, "already defined: {:?}", head];
 
-                assert![scope.contains_item(&head), "not declared: {:?}", head];
-                assert_eq![None, scope.get(&head).unwrap().1, "already defined: {:?}", head];
+                    let expr = data::read_expr(&mut it);
 
-                let expr = data::read_expr(&mut it);
+                    assert![well_formed(&expr, &scope), "cannot form expression:\n{}\n", expr.join("\n")];
 
-                assert![well_formed(&expr, &scope), "cannot form expression:\n{}\n", expr.join("\n")];
+                    let ty = &scope.get(&head).unwrap().0;
 
-                let ty = &scope.get(&head).unwrap().0;
+                    assert![typecheck(&expr, ty, &scope, &mut HashMap::new()), "value doesn't conform to the corresponding type: {:?}", head];
 
-                assert![typecheck(&expr, ty, &scope), "value doesn't conform to the corresponding type: {:?}", head];
+                    scope.get_mut(&head).unwrap().1 = Some(expr);
 
-                scope.get_mut(&head).unwrap().1 = Some(expr);
+                    if unsafe { CFG.verbose } {
+                        println!["#defined\n{}\n", head]
+                    }
 
-                if unsafe { CFG.verbose } {
-                    println!["#defined\n{}\n", head]
+                } else {
+                    assert![well_formed(&lhs, &scope), "LHS isn't well-formed"];
+
+                    let mut vars = HashMap::new();
+
+                    assert![typecheck(&lhs, &[], &scope, &mut vars), "LHS isn't well-typed"];
+
+                    let rhs = data::read_expr(&mut it);
+
+                    assert![well_formed(&rhs, &scope), "RHS isn't well-formed"];
+                    assert![typecheck(&rhs, &[], &scope, &mut vars), "RHS isn't well-typed"];
+
+                    scope.new_eq_class(lhs.clone());
+                    scope.add_eq(&lhs, rhs);
+
+                    if unsafe { CFG.verbose } {
+                        println!["#defined\n{}\n", lhs.join("\n")]
+                    }
                 }
             },
+
             "??" => {
                 let expr = data::read_expr(&mut it);
                 let ty = data::read_expr(&mut it);
 
-                if typecheck(&expr, &ty, &scope) {
-                    println!["#y"];
+                let mut vars = HashMap::new();
+
+                if typecheck(&expr, &ty, &scope, &mut vars) {
+                    println!["#y\n{}", vars.len()];
+
+                    for (var, ty) in vars {
+                        println!["{}\n{}\n", var, ty.join("\n")];
+                    }
 
                 } else {
                     println!["#n"];

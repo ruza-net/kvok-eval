@@ -1,3 +1,6 @@
+use std::collections::HashSet;
+
+
 // [AREA] Expression Operations
 //
 //- [AREA] Levels
@@ -47,15 +50,15 @@ pub fn into_parts(expr: &str) -> (usize, &str) {
 
 /// Returns the indices at which a specified variable appears.
 ///
-pub fn contains_var(expr: &[String], name: &str) -> Vec<usize> {
-    let mut occurences = vec![];
+pub fn contains_var(expr: &[String], name: &str) -> HashSet<usize> {
+    let mut occurences = HashSet::new();
     let mut found_lvl = 0;
 
     for (i, line) in expr.iter().enumerate() {
         let (lvl, line) = into_parts(line);
 
         if line == name {
-            occurences.push(i);
+            occurences.insert(i);
             found_lvl = lvl;
 
         } else if found_lvl >= lvl &&
@@ -65,7 +68,7 @@ pub fn contains_var(expr: &[String], name: &str) -> Vec<usize> {
             line == &format!["?{}", name]
         )  {
 
-            occurences = vec![];
+            occurences.clear();
         }
     }
 
@@ -75,10 +78,15 @@ pub fn contains_var(expr: &[String], name: &str) -> Vec<usize> {
 pub fn subst(expr: &mut [String], old: &str, new: String) {
     let indices = contains_var(expr, old);
 
-    for i in indices {
-        let lvl = count_lvl(&expr[i]);
+    for (i, line) in expr.iter_mut().enumerate() {
+        if indices.contains(&i) {
+            let lvl = count_lvl(line);
 
-        expr[i] = format!("{}{}", "\t".repeat(lvl), new);
+            *line = format!("{}{}", "\t".repeat(lvl), new);
+
+        } else if line == &format!["?{}", old] {
+            *line = format!["?{}", new];
+        }
     }
 }
 
@@ -185,22 +193,31 @@ pub fn split_by_lvl(expr: &[String], lvl: usize) -> Vec<&[String]> {
     ret
 }
 
-pub fn recurse<X, D>(
+pub fn recurse<X, D, O>(
     expr: &[String],
     data: D,
+    out: &mut O,
     default: X,
-    on_singleton: fn(D, &str) -> X,
-    on_lambda: fn(D, &str, &[String], &[String]) -> X,
-    on_func_ty: fn(D, &str, &[String], &[String]) -> X,
-    on_call: fn(D, &[Vec<String>], &str) -> X,
+    on_singleton: fn(D, &mut O, &str) -> X,
+    on_variable: fn(D, &mut O, &str) -> X,
+    on_lambda: fn(D, &mut O, &str, &[String], &[String]) -> X,
+    on_func_ty: fn(D, &mut O, &str, &[String], &[String]) -> X,
+    on_call: fn(D, &mut O, &[Vec<String>], &str) -> X,
 ) -> X where X: PartialEq, D: Copy {
 
     let elems = split_by_lvl(expr, 0);
 
     for elem in elems {
         match &elem[..] {
+            [var] if &var[0..=0] == "?" => {
+                let ret = on_variable(data, out, var);
+
+                if default != ret {
+                    return ret;
+                }
+            },
             [x] => {
-                let ret = on_singleton(data, x);
+                let ret = on_singleton(data, out, x);
 
                 if default != ret {
                     return ret;
@@ -216,7 +233,7 @@ pub fn recurse<X, D>(
                 if let [.., bound_ty] = split_by_lvl(&body, 0)[..] {
                     // NOTE: Permits empty lambda body.
                     //
-                    let ret = on_lambda(data, bound, bound_ty, &body[..body.len() - bound_ty.len()]);
+                    let ret = on_lambda(data, out, bound, bound_ty, &body[..body.len() - bound_ty.len()]);
 
                     if default != ret {
                         return ret;
@@ -236,7 +253,7 @@ pub fn recurse<X, D>(
                     shift_left(&mut source, 1);
                     shift_left(&mut target, 1);
 
-                    let ret = on_func_ty(data, bound, &source, &target);
+                    let ret = on_func_ty(data, out, bound, &source, &target);
 
                     if default != ret {
                         return ret;
@@ -254,7 +271,7 @@ pub fn recurse<X, D>(
                     shift_left(arg, 1);
                 }
 
-                let ret = on_call(data, &args, func);
+                let ret = on_call(data, out, &args, func);
 
                 if default != ret {
                     return ret;
