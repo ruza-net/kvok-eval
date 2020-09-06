@@ -5,12 +5,11 @@ extern crate structopt;
 mod data;
 mod scope;
 
-use std::collections::HashMap;
 use std::io::{ self, BufRead };
 
 use structopt::StructOpt;
 
-use scope::{ Signature, Scope };
+use scope::Env;
 use data::{ shift_left, shift_right, subst };
 
 #[derive(StructOpt)]
@@ -24,7 +23,7 @@ struct Config {
 static mut CFG: Config = Config { verbose: false };
 
 
-fn equal(a: &[String], b: &[String], scope: &Scope) -> bool {
+fn equal(a: &[String], b: &[String], scope: &Env) -> bool {
     if a == b {
         true
 
@@ -39,13 +38,13 @@ fn equal(a: &[String], b: &[String], scope: &Scope) -> bool {
 
 // [AREA] Well-Formedness
 //
-fn _wf_sgl(scope: &Scope, x: &str) -> bool {
+fn _wf_sgl(scope: &Env, x: &str) -> bool {
     debug("[canform] typ == x || ?x");
 
     "typ" == x || scope.contains_item(x)
 }
 
-fn _wf_lambda(scope: &Scope, bound: &str, bound_ty: &[String], body: &[String]) -> bool {
+fn _wf_lambda(scope: &Env, bound: &str, bound_ty: &[String], body: &[String]) -> bool {
     let mut inner_scope = scope.clone();
     inner_scope.insert(bound.to_string(), (bound_ty.to_vec(), None));
 
@@ -54,7 +53,7 @@ fn _wf_lambda(scope: &Scope, bound: &str, bound_ty: &[String], body: &[String]) 
     well_formed(body, &inner_scope)
 }
 
-fn _wf_fn_ty(scope: &Scope, bound: &str, source: &[String], target: &[String]) -> bool {
+fn _wf_fn_ty(scope: &Env, bound: &str, source: &[String], target: &[String]) -> bool {
     let mut inner_scope = scope.clone();
     inner_scope.insert(bound.to_string(), (source.to_vec(), None));
 
@@ -63,13 +62,13 @@ fn _wf_fn_ty(scope: &Scope, bound: &str, source: &[String], target: &[String]) -
     well_formed(source, scope) && well_formed(target, &inner_scope)
 }
 
-fn _wf_call(scope: &Scope, args: &[Vec<String>], fn_name: &str) -> bool {
+fn _wf_call(scope: &Env, args: &[Vec<String>], fn_name: &str) -> bool {
     debug("[canform] (canform fn_name) && (canform args)");
 
     _wf_sgl(scope, fn_name) && args.iter().all(|arg| well_formed(arg, scope))
 }
 
-fn well_formed(expr: &[String], scope: &Scope) -> bool {
+fn well_formed(expr: &[String], scope: &Env) -> bool {
     data::recurse(expr, scope, true, _wf_sgl, _wf_lambda, _wf_fn_ty, _wf_call)
 }
 //
@@ -78,7 +77,7 @@ fn well_formed(expr: &[String], scope: &Scope) -> bool {
 
 // [AREA] Typechecking
 //
-fn _tc_sgl((ty, scope): (&[String], &Scope), x: &str) -> bool {
+fn _tc_sgl((ty, scope): (&[String], &Env), x: &str) -> bool {
     if "typ" == x {
         debug("[??] typ == ty");
 
@@ -93,7 +92,7 @@ fn _tc_sgl((ty, scope): (&[String], &Scope), x: &str) -> bool {
     }
 }
 
-fn _tc_lambda((ty, scope): (&[String], &Scope), bound: &str, bound_ty: &[String], body: &[String]) -> bool {
+fn _tc_lambda((ty, scope): (&[String], &Env), bound: &str, bound_ty: &[String], body: &[String]) -> bool {
     let ty = reduce_n_times(ty.to_vec(), scope, 0);
 
     if let [.., head] = &ty[..] {
@@ -132,7 +131,7 @@ fn _tc_lambda((ty, scope): (&[String], &Scope), bound: &str, bound_ty: &[String]
     }
 }
 
-fn _tc_fn_ty((ty, scope): (&[String], &Scope), bound: &str, source: &[String], target: &[String]) -> bool {
+fn _tc_fn_ty((ty, scope): (&[String], &Env), bound: &str, source: &[String], target: &[String]) -> bool {
     assert![equal(&["typ".to_string()], ty, scope), "doesn't match: typ ~~ {:?}", ty];
 
     let mut inner_scope = scope.clone();
@@ -145,7 +144,7 @@ fn _tc_fn_ty((ty, scope): (&[String], &Scope), bound: &str, source: &[String], t
     typecheck(source, &typ, scope) && typecheck(&target, &typ, &inner_scope)
 }
 
-fn _tc_call_util(ret_ty: &[String], scope: &Scope, args: &[Vec<String>], fn_ty: &[String]) -> bool {
+fn _tc_call_util(ret_ty: &[String], scope: &Env, args: &[Vec<String>], fn_ty: &[String]) -> bool {
     let fn_ty = reduce_n_times(fn_ty.to_vec(), scope, 0);
 
     if let [ref rest @ .., head] = &fn_ty[..] {
@@ -198,13 +197,13 @@ fn _tc_call_util(ret_ty: &[String], scope: &Scope, args: &[Vec<String>], fn_ty: 
         panic!["invalid function type: {:?}", fn_ty]
     }
 }
-fn _tc_call((ty, scope): (&[String], &Scope), args: &[Vec<String>], fn_name: &str) -> bool {
+fn _tc_call((ty, scope): (&[String], &Env), args: &[Vec<String>], fn_name: &str) -> bool {
     let (fn_ty, _) = scope.get(fn_name).unwrap();
 
     _tc_call_util(ty, scope, args, fn_ty)
 }
 
-fn typecheck(expr: &[String], ty: &[String], scope: &Scope) -> bool {
+fn typecheck(expr: &[String], ty: &[String], scope: &Env) -> bool {
     assert![well_formed(expr, scope), "expression isn't well-formed"];
 
     data::recurse(expr, (ty, scope), true, _tc_sgl, _tc_lambda, _tc_fn_ty, _tc_call)
@@ -221,7 +220,7 @@ fn typecheck(expr: &[String], ty: &[String], scope: &Scope) -> bool {
 /// # Returns
 /// Returns whether the expression can be reduced further.
 ///
-fn reduce(expr: Vec<String>, scope: &Scope) -> (bool, Vec<String>) {
+fn reduce(expr: Vec<String>, scope: &Env) -> (bool, Vec<String>) {
     assert![well_formed(&expr, scope), "expression isn't well-formed"];
 
     let mut extend_eq_family = None;
@@ -430,7 +429,7 @@ fn reduce(expr: Vec<String>, scope: &Scope) -> (bool, Vec<String>) {
 /// # Panics
 /// This function panics when the expression isn't well-formed or well-typed.
 ///
-fn reduce_n_times(expr: Vec<String>, scope: &Scope, mut depth: usize) -> Vec<String> {
+fn reduce_n_times(expr: Vec<String>, scope: &Env, mut depth: usize) -> Vec<String> {
     let (mut more, mut ret) = reduce(expr, scope);
 
     while more && depth != 1 {
@@ -452,7 +451,7 @@ fn main() {
 
     let mut it = stdin.lock().lines().map(|l| l.expect("couldn't read line"));
 
-    let mut scope = Scope::new();
+    let mut scope = Env::new();
 
     while let Some(line) = it.next() {
         match line.as_ref() {
@@ -544,7 +543,7 @@ mod well_formedness {
         "typ".into(),
         ];
 
-        assert![well_formed(src, &Scope::new()), "isn't well-formed"]
+        assert![well_formed(src, &Env::new()), "isn't well-formed"]
     }
 
     #[test]
@@ -558,7 +557,7 @@ mod well_formedness {
         "a".into(),
         ];
 
-        assert![!well_formed(src, &Scope::new()), "isn't well-formed"]
+        assert![!well_formed(src, &Env::new()), "isn't well-formed"]
     }
 
     #[test]
@@ -572,7 +571,7 @@ mod well_formedness {
         "typ".into(),
         ];
 
-        assert![!well_formed(src, &Scope::new()), "isn't well-formed"]
+        assert![!well_formed(src, &Env::new()), "isn't well-formed"]
     }
 
     #[test]
@@ -586,6 +585,6 @@ mod well_formedness {
         "typ".into(),
         ];
 
-        assert![!well_formed(src, &Scope::new()), "isn't well-formed"]
+        assert![!well_formed(src, &Env::new()), "isn't well-formed"]
     }
 }

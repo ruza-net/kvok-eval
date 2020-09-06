@@ -44,35 +44,41 @@ pub fn into_parts(expr: &str) -> (usize, &str) {
 
 //- [AREA] Substitutions
 //-
-pub fn contains_var(expr: &[String], name: &str) -> bool {
-    let mut found = false;
+
+/// Returns the indices at which a specified variable appears.
+///
+pub fn contains_var(expr: &[String], name: &str) -> Vec<usize> {
+    let mut occurences = vec![];
     let mut found_lvl = 0;
 
-    for line in expr {
+    for (i, line) in expr.iter().enumerate() {
         let (lvl, line) = into_parts(line);
 
         if line == name {
-            found = true;
+            occurences.push(i);
             found_lvl = lvl;
 
-        } else if found && line == &format!(">{}", name) && found_lvl >= lvl {
-            found = false;
+        } else if found_lvl >= lvl &&
+        (
+            line == &format![">{}", name] ||
+            line == &format!["<{}", name] ||
+            line == &format!["?{}", name]
+        )  {
 
-        } else if found && line == &format!("<{}", name) && found_lvl >= lvl {
-            found = false;
+            occurences = vec![];
         }
     }
 
-    found
+    occurences
 }
 
 pub fn subst(expr: &mut [String], old: &str, new: String) {
-    for line in expr {
-        let (lvl, princ) = into_parts(line);
+    let indices = contains_var(expr, old);
 
-        if princ == old {
-            *line = format!("{}{}", "\t".repeat(lvl), new);
-        }
+    for i in indices {
+        let lvl = count_lvl(&expr[i]);
+
+        expr[i] = format!("{}{}", "\t".repeat(lvl), new);
     }
 }
 
